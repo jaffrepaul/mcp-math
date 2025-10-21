@@ -1,0 +1,21 @@
+{
+  "name": "mcp-math-server",
+  "version": "1.0.0",
+  "description": "MCP server for mathematical operations using mathjs",
+  "type": "module",
+  "main": "dist/index.js",
+  "scripts": {
+    "build": "tsc",
+    "dev": "tsc && node dist/index.js",
+    "start": "node dist/index.js"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.0.4",
+    "@sentry/node": "^10.20.0",
+    "mathjs": "^13.2.2"
+  },
+  "devDependencies": {
+    "@types/node": "^22.10.2",
+    "typescript": "^5.7.2"
+  }
+}

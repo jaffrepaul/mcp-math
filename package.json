@@ -1,0 +1,20 @@
+{
+  "name": "mcp-math",
+  "version": "1.0.0",
+  "description": "Math quiz application with MCP server mathematical coprocessor",
+  "private": true,
+  "workspaces": [
+    "frontend",
+    "mcp-server"
+  ],
+  "scripts": {
+    "install:all": "npm install && npm install --workspace=frontend && npm install --workspace=mcp-server",
+    "dev:frontend": "npm run dev --workspace=frontend",
+    "dev:mcp": "npm run dev --workspace=mcp-server",
+    "build:frontend": "npm run build --workspace=frontend",
+    "build:mcp": "npm run build --workspace=mcp-server"
+  },
+  "dependencies": {
+    "@sentry/react": "^10.20.0"
+  }
+}

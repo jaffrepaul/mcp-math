@@ -1,0 +1,10 @@
+{
+  "mcpServers": {
+    "math": {
+      "command": "node",
+      "args": [
+        "${HOME}/path/to/mcp-math/mcp-server/dist/index.js"
+      ]
+    }
+  }
+}
