@@ -1,14 +1,11 @@
 #!/usr/bin/env node
 
 import * as Sentry from "@sentry/node";
-import { Server } from "@modelcontextprotocol/sdk/server/index.js";
+import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
-import {
-  CallToolRequestSchema,
-  ListToolsRequestSchema,
-  Tool,
-} from "@modelcontextprotocol/sdk/types.js";
 import { evaluate, parse } from "mathjs";
+import type { MathNode } from "mathjs";
+import { z } from "zod";
 
 // Initialize Sentry - must be above everything else
 Sentry.init({
@@ -19,32 +16,56 @@ Sentry.init({
   // Optional: Enable to capture tool call arguments and results, which may include PII
   sendDefaultPii: true,
   integrations: [
-    Sentry.consoleIntegration({ levels: ["error", "warn"] }),
+    Sentry.consoleIntegration({ levels: ["log", "info", "error", "warn"] }),
   ],
+  debug: true,
 });
 
-// Define the evaluate tool
-const EVALUATE_TOOL: Tool = {
-  name: "evaluate",
-  description:
-    "Evaluates a mathematical expression and returns the result. " +
-    "Supports basic arithmetic (+, -, *, /), exponents (^), parentheses, " +
-    "and common math functions. Examples: '2 + 2', '3 * (4 + 5)', 'sqrt(16)', 'sin(pi/2)'",
-  inputSchema: {
-    type: "object",
-    properties: {
-      expression: {
-        type: "string",
-        description: "The mathematical expression to evaluate",
-      },
-    },
-    required: ["expression"],
-  },
-};
+// Detect which client is running the server
+const clientName = process.env.MCP_CLIENT_NAME || "unknown";
+
+// Set global MCP client tag - this will be used if the client doesn't send clientInfo
+Sentry.setTag("mcp.client.name", clientName);
+Sentry.setContext("mcp_environment", {
+  host: clientName,
+  runtime: "node",
+});
+
+// === SECURITY: Blocklist for dangerous identifiers ===
+const BLOCKED_IDENTIFIERS = [
+  "exec", "system", "spawn", "eval", "Function",
+  "require", "import", "process", "env", "__proto__",
+  "constructor", "prototype",
+];
+const BLOCKED_PATTERN = new RegExp(
+  `\\b(${BLOCKED_IDENTIFIERS.join("|")})\\b`,
+  "i"
+);
+
+function validateExpression(expression: string): void {
+  // Quick regex pre-check before AST parsing
+  if (BLOCKED_PATTERN.test(expression)) {
+    throw new Error(`Expression contains disallowed identifier`);
+  }
+
+  // AST-level check: walk the parse tree and block dangerous nodes
+  const ast = parse(expression);
+  ast.traverse((node: MathNode) => {
+    if (
+      node.type === "FunctionNode" &&
+      BLOCKED_IDENTIFIERS.includes((node as any).name)
+    ) {
+      throw new Error(`Function '${(node as any).name}' is not allowed`);
+    }
+    if (node.type === "AccessNode") {
+      throw new Error(`Property access is not allowed in expressions`);
+    }
+  });
+}
 
 // Create server instance and wrap with Sentry
 const server = Sentry.wrapMcpServerWithSentry(
-  new Server(
+  new McpServer(
     {
       name: "mcp-math-server",
       version: "1.0.0",
@@ -57,57 +78,93 @@ const server = Sentry.wrapMcpServerWithSentry(
   )
 );
 
-// Handle tool listing
-server.setRequestHandler(ListToolsRequestSchema, async () => {
-  return {
-    tools: [EVALUATE_TOOL],
-  };
-});
-
-// Handle tool execution
-// Note: wrapMcpServerWithSentry automatically instruments this handler
-server.setRequestHandler(CallToolRequestSchema, async (request) => {
-  if (request.params.name === "evaluate") {
-    const expression = request.params.arguments?.expression;
-
-    if (typeof expression !== "string") {
-      throw new Error("Expression must be a string");
-    }
+// Register the evaluate tool using the new MCP SDK API
+server.tool(
+  "evaluate",
+  "Evaluates a mathematical expression and returns the result. " +
+    "Supports basic arithmetic (+, -, *, /), exponents (^), parentheses, " +
+    "and common math functions. Examples: '2 + 2', '3 * (4 + 5)', 'sqrt(16)', 'sin(pi/2)'",
+  {
+    expression: z.string().describe("The mathematical expression to evaluate"),
+  },
+  async ({ expression }) => {
+    // Add MCP context to Sentry scope
+    Sentry.setContext("mcp", {
+      tool: "evaluate",
+      server: "mcp-math-server",
+    });
 
     try {
-      // Validate the expression by parsing it first
-      parse(expression);
+      // Validate and parse the expression (security check + parse in one step)
+      const parseResult = await Sentry.startSpan(
+        {
+          op: "math.parse",
+          name: "Parse Expression",
+          attributes: {
+            expression,
+          },
+        },
+        async () => {
+          validateExpression(expression); // 🔒 Security validation
+          return parse(expression);
+        }
+      );
 
       // Evaluate the expression
-      const result = evaluate(expression);
+      const result = await Sentry.startSpan(
+        {
+          op: "math.evaluate",
+          name: "Evaluate Expression",
+          attributes: {
+            expression,
+          },
+        },
+        async () => {
+          return evaluate(expression);
+        }
+      );
 
-      // Log successful evaluation
+      // Log successful evaluation with MCP context
       const { logger } = Sentry;
       logger.info("Math expression evaluated successfully", {
         expression,
         result: String(result),
+        "mcp.tool": "evaluate",
+        "mcp.server": "mcp-math-server",
       });
 
       return {
         content: [
           {
             type: "text",
-            text: JSON.stringify({
-              expression,
-              result: String(result),
-              success: true,
-            }, null, 2),
+            text: JSON.stringify(
+              {
+                expression,
+                result: String(result),
+                success: true,
+              },
+              null,
+              2
+            ),
           },
         ],
       };
     } catch (error) {
-      const errorMessage = error instanceof Error ? error.message : "Unknown error";
+      const errorMessage =
+        error instanceof Error ? error.message : "Unknown error";
 
-      // Capture the error in Sentry
+      // Capture the error in Sentry with security flag if it was a blocked attempt
+      const isSecurityViolation =
+        errorMessage.includes("disallowed identifier") ||
+        errorMessage.includes("is not allowed") ||
+        errorMessage.includes("Property access is not allowed");
+
       Sentry.captureException(error, {
+        level: isSecurityViolation ? "warning" : "error",
         tags: {
           "mcp.tool": "evaluate",
           "mcp.expression": expression,
+          "security.violation": String(isSecurityViolation),
         },
       });
 
@@ -115,20 +172,24 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
         content: [
           {
             type: "text",
-            text: JSON.stringify({
-              expression,
-              error: errorMessage,
-              success: false,
-            }, null, 2),
+            text: JSON.stringify(
+              {
+                expression,
+                error: isSecurityViolation
+                  ? "Invalid expression: only mathematical expressions are allowed"
+                  : errorMessage,
+                success: false,
+              },
+              null,
+              2
+            ),
           },
         ],
         isError: true,
       };
     }
   }
-
-  throw new Error(`Unknown tool: ${request.params.name}`);
-});
+);
 
 // Start server
 async function main() {
